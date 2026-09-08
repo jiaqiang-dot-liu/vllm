@@ -766,6 +766,24 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
             # which would inflate weights and OOM.
             intermediate_size = round_up(intermediate_size, 128)
             hidden_size = round_up(hidden_size, 128)
+        elif (
+            backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+            and intermediate_size % 128 == 0
+        ):
+            # AITER's a4w4 (per_1x32) MoE arm does NOT require inter_dim % 256.
+            # aiter/fused_moe.py never takes the 1-stage assembly path for
+            # QuantType.per_1x32 (see the `run_1stage` ladder), and the grouped
+            # GEMM tile chooser in aiter/ops/flydsl/moe_kernels.py explicitly
+            # falls back to tile_n=128 whenever `inter_dim % 256 != 0` -- its own
+            # docstring cites DSV4 TP8 inter=640 as the motivating shape.  The
+            # generic ROCm 256 round-up therefore buys no kernel eligibility on
+            # this arm; it only inflates the weights.  MiniMax-M3 at TP8 has
+            # 3072/8 = 384 per partition, which the 256 rule pads to 512: +33%
+            # w13/w2 HBM bytes and +33% MoE GEMM N-work across 57 layers x 128
+            # experts, all of it multiply-by-zero.  Align to 128 instead (a
+            # no-op for 384) and keep hidden_size on the 256 rule.
+            intermediate_size = round_up(intermediate_size, 128)
+            hidden_size = round_up(hidden_size, 256)
         else:
             intermediate_size = round_up(intermediate_size, 256)
             hidden_size = round_up(hidden_size, 256)
@@ -1086,15 +1104,38 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         # e8m0_shuffle on weight scales (GFX950 swizzle layout)
         from aiter.utility.fp4_utils import e8m0_shuffle
 
+        def _neutral_pad_scale_groups(scale: torch.Tensor) -> torch.Tensor:
+            """Pad the e8m0 group dim up to a multiple of 8 with 1.0 exponents.
+
+            aiter's ``shuffle_scale()`` pads the minor (K//32) dim up to a
+            multiple of 8 using a bare ``torch.empty()`` and only copies the
+            valid region, so the tail lanes hold uninitialised bytes.  That is
+            invisible while the minor dim is already 8-aligned (which the old
+            ``inter_dim % 256`` round-up silently guaranteed: 256/32 = 8) but
+            feeds garbage exponents to the CK a4w4 kernel as soon as it is not
+            -- e.g. inter_dim=384 -> 12 groups.  Pre-pad here with 0x7F, the
+            e8m0 encoding of 1.0, so the tail is neutral whether or not the
+            kernel reads it; the matching weight tail is zero.
+            """
+            e, n, k = scale.shape
+            if k % 8 == 0:
+                return scale
+            padded = torch.empty(
+                (e, n, (k + 7) // 8 * 8), dtype=scale.dtype, device=scale.device
+            )
+            padded.view(torch.uint8).fill_(0x7F)
+            padded[:, :, :k] = scale
+            return padded
+
         s0, s1, _ = w13_weight_scale.shape
-        w13_weight_scale.data = e8m0_shuffle(w13_weight_scale.view(s0 * s1, -1)).view(
-            s0, s1, -1
-        )
+        w13_weight_scale.data = e8m0_shuffle(
+            _neutral_pad_scale_groups(w13_weight_scale.data).view(s0 * s1, -1)
+        ).view(s0, s1, -1)
 
         s0, s1, _ = w2_weight_scale.shape
-        w2_weight_scale.data = e8m0_shuffle(w2_weight_scale.view(s0 * s1, -1)).view(
-            s0, s1, -1
-        )
+        w2_weight_scale.data = e8m0_shuffle(
+            _neutral_pad_scale_groups(w2_weight_scale.data).view(s0 * s1, -1)
+        ).view(s0, s1, -1)
 
         # View as native FP4 dtype
         fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
