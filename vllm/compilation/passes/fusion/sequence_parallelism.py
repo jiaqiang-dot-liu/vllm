@@ -75,6 +75,21 @@ def get_sequence_parallelism_threshold(
     if current_platform.is_xpu():
         min_hidden_size = 4096
         min_per_gpu_size_mb = 8.0
+    elif current_platform.is_rocm():
+        # Without this branch ROCm falls through to `return None` below,
+        # which makes VllmConfig force-disable enable_sp *and*
+        # fuse_gemm_comms (async TP) on every ROCm run, silently ignoring
+        # a user-supplied pass_config.enable_sp=True.
+        try:
+            gcn_arch = getattr(
+                torch.cuda.get_device_properties(0), "gcnArchName", ""
+            )
+        except Exception:
+            return None
+        if not any(gfx in gcn_arch for gfx in ("gfx94", "gfx95")):
+            return None
+        min_hidden_size = 2048
+        min_per_gpu_size_mb = 2.0
     elif current_platform.is_cuda():
         capability = current_platform.get_device_capability()
         if capability is None:
