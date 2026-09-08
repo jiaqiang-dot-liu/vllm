@@ -241,8 +241,16 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     if n > 2048 and m > 512:
         return False
     return (
+        # hidden_size 2880 models (gpt-oss), TP=1 qkv / o_proj
         (m == 5120 and k == 2880)
         or (m == 2880 and k == 4096)
+        # TP=2 shards of the same qkv / o_proj pair
+        or (m == 2560 and k == 2880)
+        or (m == 2880 and k == 2048)
+        # TP=4 shards of the same qkv / o_proj pair
+        or (m == 1280 and k == 2880)
+        or (m == 2880 and k == 1024)
+        # small aux projections and TP=8 shards
         or (m == 128 and k == 2880)
         or (m == 640 and k == 2880)
         or (m == 2880 and k == 512)
