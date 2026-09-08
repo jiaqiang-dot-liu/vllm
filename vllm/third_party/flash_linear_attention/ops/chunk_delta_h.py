@@ -20,6 +20,27 @@ NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
 _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
 
+# The h-stage grid is (cdiv(V, BV), N * H), so every V-block re-streams the whole
+# k / w / g / gk sequence for its (sequence, head). At V = 128 the shipped BV list
+# ([32, 64]) forces 2-4 redundant passes; with a per-channel gate (KDA gk is fp32
+# [T, H, 128]) that operand dominates the stage's HBM traffic.
+#
+# BV tiles only the V axis -- the body is hardcoded around 64-wide K sub-blocks
+# (b_h1..b_h4, each [BV, 64]) -- so BV == V is structurally valid and removes the
+# redundancy. It must be paired with num_warps = 8: at K = V = 128 a BV = 128
+# config holds 2 x [128, 64] fp32 accumulators, 32 VGPRs/lane at num_warps = 8 but
+# 64 VGPRs/lane at num_warps = 4, which only spills.
+#
+# Tiling knobs only -- every config computes the same result, and the autotuner
+# prunes anything that fails to compile or exceeds the register/LDS budget
+# (OutOfResources -> +inf), so this cannot regress below the previous best.
+if torch.version.hip:
+    _CHUNK_DELTA_H_NUM_WARPS = [2, 4, 8]
+    _CHUNK_DELTA_H_BV = [32, 64, 128]
+else:
+    _CHUNK_DELTA_H_NUM_WARPS = [2, 4]
+    _CHUNK_DELTA_H_BV = [32, 64]
+
 
 @triton.heuristics(
     {
@@ -34,9 +55,9 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
 @triton.autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
+        for num_warps in _CHUNK_DELTA_H_NUM_WARPS
         for num_stages in _CHUNK_DELTA_H_NUM_STAGES
-        for BV in [32, 64]
+        for BV in _CHUNK_DELTA_H_BV
     ],
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
