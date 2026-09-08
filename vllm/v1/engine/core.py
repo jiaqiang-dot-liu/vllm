@@ -237,6 +237,21 @@ class EngineCore:
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        # Prefill cadence for single-engine (non-DP) deployments. Upstream only
+        # wires `prefill_schedule_interval` into DPEngineCoreProc, so on a plain
+        # TP-only engine the scheduler's prefill-deferral path (`defer_prefills`)
+        # is unreachable and every step is a large mixed prefill+decode batch.
+        # Honouring the interval here confines long prefills to cadence-aligned
+        # steps, so intervening steps are (near-)uniform decode batches: cheaper
+        # per step, and eligible for full CUDA graphs on backends whose support
+        # level is UNIFORM_BATCH (e.g. ROCm AITER MLA).
+        # Default stays 1 == disabled, so this is a strict no-op unless the
+        # operator opts in via --prefill-schedule-interval N.
+        self._prefill_schedule_interval = (
+            vllm_config.scheduler_config.prefill_schedule_interval
+        )
+        self._prefill_cadence_step = 0
+
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
@@ -582,9 +597,28 @@ class EngineCore:
             eco.scheduler_stats.iteration_details = iteration_details
 
     def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise."""
-        return False
+        """Whether to defer new prefills this step.
+
+        Overridden by the DP engine core, which aligns the cadence across
+        ranks. For a single (non-DP) engine there is nothing to align, but the
+        same cadence is still useful purely as a local batch-composition
+        policy: admitting prefills only every Nth step keeps the intervening
+        steps decode-only instead of folding a multi-thousand-token prefill
+        chunk into every forward pass.
+
+        Called exactly once per scheduling step (`step` and
+        `step_with_batch_queue` are mutually exclusive via `step_fn`), so it is
+        safe to advance the cadence counter here.
+
+        Returns False when the interval is 1 (the default), preserving upstream
+        behaviour exactly. The scheduler additionally suppresses deferral when
+        it is capacity-bound (`prefill_capacity_bound`) or when no decode work
+        exists, so this cannot stall the waiting queue.
+        """
+        if self._prefill_schedule_interval <= 1:
+            return False
+        self._prefill_cadence_step += 1
+        return self._prefill_cadence_step % self._prefill_schedule_interval != 0
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
