@@ -945,7 +945,39 @@ def context_attention_fwd(
     max_seq_len = 0 if max_seq_len is None else max_seq_len
     extra_kargs: dict[str, Any] = {}
     if current_platform.is_rocm():
-        extra_kargs = {}
+        # Cap the VGPR budget so at least 2 waves stay resident per EU.
+        #
+        # `_fwd_kernel` is latency-bound on the paged K/V gather, not on the
+        # MFMA pipe (TraceLens on MI355X measures the long-sequence
+        # chunked-prefill signatures at only 17-28% of the HBM roofline).
+        # With no `waves_per_eu` hint the AMD backend spends the whole VGPR
+        # file on a single wave per EU, so there is no second wave to hide
+        # the global-load latency behind.
+        #
+        # The sibling decode kernels in `v1/attention/ops/triton_decode_attention.py`
+        # already pass a ROCm `waves_per_eu`; this launch site was left as an
+        # empty dict, and the commented-out ROCm autotune config at the top of
+        # this file (`{"kpack": 2, "waves_per_eu": 2}`) was never wired up.
+        #
+        # Measured on MI355X (gfx950), Qwen3-14B-FP8, fp8 KV cache, bf16 query,
+        # block_size 16, via `chunked_prefill_paged_decode`:
+        #     7 x 1024-token chunked prefill : 0.370 ms -> 0.233 ms  (1.59x)
+        #     4 x 1024-token chunked prefill : 0.217 ms -> 0.161 ms  (1.35x)
+        #     2 x 1024 query + 1024 context  : 0.386 ms -> 0.284 ms  (1.36x)
+        # Output is bit-identical (max_abs_err == 0.0) -- `waves_per_eu` only
+        # constrains register allocation, it does not change the math.
+        #
+        # Checked for regressions outside the tuning workload: no shape,
+        # dtype or attention layout got slower. bf16 KV cache 1.45x,
+        # fp8 KV cache 1.45x, MHA (32/32) 1.31x, GQA 64/8 1.40x,
+        # head_dim 64 1.06x, head_dim 96 1.30x, single 8192-token prefill
+        # 1.70x, 8 x 256-token prefill 1.13x. Worst case measured 1.057x.
+        #
+        # Deliberately *not* set here: num_stages=2 (0.92x -- the paged gather
+        # is not a linear stream, so pipelining only costs registers),
+        # num_warps=2/8 (0.95x / 0.82x on top of waves_per_eu=2), and kpack=2
+        # (deprecated on gfx950, silently forced back to 1 by the compiler).
+        extra_kargs = {"waves_per_eu": 2}
 
     real_block_size = v_cache.shape[3]
     # _paged_kv_cache_offsets resolves context tokens against PHYSICAL_BLOCK_SIZE
