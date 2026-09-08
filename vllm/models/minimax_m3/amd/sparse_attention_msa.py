@@ -14,6 +14,71 @@ from vllm.v1.attention.backend import (
 )
 
 
+# One slot per rank. Holds the decode sparse block table built by the most
+# recent sparse layer that actually ran the lightning indexer, so the
+# ``index_topk_freq`` layers that reuse that layer's ``topk_indices_buffer``
+# selection can reuse the table derived from it instead of rebuilding it.
+#
+# Written by every non-skipped layer, and the first sparse layer of a forward
+# pass is never skipped, so the slot is refreshed at the start of every pass.
+_DECODE_SBT_SLOT: dict = {}
+
+
+def _decode_sparse_block_table(
+    layer: AttentionLayer,
+    topk_rows: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    decode_query_len: int,
+    block_page_stride: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the page-16 decode sparse block table, or reuse a shared one.
+
+    A layer with ``skip_index_topk`` set did not run its indexer: it reads the
+    selection a preceding layer wrote into the shared ``topk_indices_buffer``
+    this same forward pass (see ``_should_skip_index_topk`` and
+    ``MiniMaxM3SparseAttention._run_attention``). The sparse block table is a
+    pure function of that selection plus ``block_table`` / ``seq_lens`` /
+    ``decode_query_len`` / the page stride, all identical across the group, so
+    the preceding layer's table is exactly what this layer would rebuild.
+
+    With ``use_index_cache`` off, ``skip_index_topk`` is always False and every
+    layer builds its own table, i.e. behaviour is unchanged.
+    """
+    from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+        minimax_m3_build_sparse_block_table_decode,
+    )
+
+    total_q = topk_rows.shape[1]
+    topk_width = topk_rows.shape[-1]
+    key = (
+        total_q,
+        topk_width,
+        decode_query_len,
+        block_page_stride,
+        block_table.data_ptr(),
+        seq_lens.data_ptr(),
+    )
+
+    if getattr(layer, "skip_index_topk", False):
+        cached = _DECODE_SBT_SLOT.get("decode")
+        if cached is not None and cached[2] == key:
+            return cached[0], cached[1]
+        # Shape or buffer identity moved under us (first call after a resize or
+        # a capture/replay boundary): fall through and build, which is always
+        # correct, just not free.
+
+    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_decode(
+        topk_rows,
+        block_table,
+        seq_lens,
+        decode_query_len,
+        block_page_stride,
+    )
+    _DECODE_SBT_SLOT["decode"] = (sparse_bt, sparse_ctx, key)
+    return sparse_bt, sparse_ctx
+
+
 class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
     """ROCm AITER page-16 SHUFFLE sparse paged attention."""
 
@@ -27,7 +92,8 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
         query_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm.models.minimax_m3.amd.ops.sparse_pa import (
-            minimax_m3_sparse_attn_decode_aiter,
+            _block_page_stride,
+            _run_gluon_decode,
             minimax_m3_sparse_attn_prefill_aiter,
         )
 
@@ -57,19 +123,25 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
         if main_md.num_decodes > 0:
             d = main_md.decode
             assert d is not None
-            minimax_m3_sparse_attn_decode_aiter(
-                q[:nd],
-                k_cache,
-                v_cache,
+            sparse_bt, sparse_ctx = _decode_sparse_block_table(
+                layer,
                 topk[:, :nd, :],
                 d.block_table,
                 d.seq_lens,
+                d.decode_query_len,
+                _block_page_stride(k_cache, v_cache),
+            )
+            _run_gluon_decode(
+                q[:nd],
+                k_cache,
+                v_cache,
+                sparse_bt,
+                sparse_ctx,
                 self.num_kv_heads,
                 self.scale,
                 out[:nd],
-                k_scale=k_scale,
-                v_scale=v_scale,
-                decode_query_len=d.decode_query_len,
+                k_scale,
+                v_scale,
             )
 
         if main_md.num_prefills > 0:
