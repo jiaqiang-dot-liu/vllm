@@ -8,6 +8,8 @@ the fused allreduce+RMSNorm path share a single AITER instance with its IPC buff
 
 """
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -16,14 +18,58 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _default_max_size() -> int:
+    """IPC buffer size (bytes) for AITER's CustomAllreduce.
+
+    Historically hardcoded to ``8192 * 1024 * 8 * 2`` == 128 MiB, which makes
+    ``effective_max_size()`` 64 MiB. With a bf16 hidden_size of 6144 that caps
+    the fused AR+RMSNorm path at 64 MiB / (6144 * 2) == 5461 tokens, so a full
+    ``max_num_batched_tokens=8192`` prefill chunk (96 MiB) falls outside both
+    the compiled fusion range (``VllmConfig._set_compile_ranges``) and the
+    runtime ``should_custom_ar`` guard -- the allreduce and the RMSNorm stay
+    unfused on exactly the chunks that dominate prefill time.
+
+    AITER's own ``CustomAllreduce`` default is 1 GiB, so 128 MiB was a
+    conservative vLLM-side choice rather than a hardware limit. Default to
+    256 MiB (effective 128 MiB == 10922 tokens at bf16 x 6144), which covers
+    an 8192-token chunk, and allow an override in MiB via
+    ``VLLM_ROCM_AITER_CUSTOM_AR_MAX_SIZE_MB`` for memory-tight deployments.
+
+    Cost: the AITER pool allocates ``max_size`` (input) + ``2 * max_size``
+    (meta) per rank, i.e. ~768 MiB/GPU at 256 MiB vs ~384 MiB/GPU at 128 MiB.
+    """
+    override = os.getenv("VLLM_ROCM_AITER_CUSTOM_AR_MAX_SIZE_MB")
+    if override:
+        try:
+            mb = int(override)
+            if mb > 0:
+                return mb * 1024 * 1024
+            logger.warning(
+                "Ignoring non-positive VLLM_ROCM_AITER_CUSTOM_AR_MAX_SIZE_MB=%s",
+                override,
+            )
+        except ValueError:
+            logger.warning(
+                "Ignoring malformed VLLM_ROCM_AITER_CUSTOM_AR_MAX_SIZE_MB=%s",
+                override,
+            )
+    return 8192 * 1024 * 8 * 2 * 2
+
+
 class AiterCustomAllreduce:
     # Default IPC buffer size for AITER's CustomAllreduce.
-    MAX_SIZE: int = 8192 * 1024 * 8 * 2
+    MAX_SIZE: int = _default_max_size()
 
     @classmethod
     def effective_max_size(cls) -> int:
         """
         Max input byte size eligible for AITER custom allreduce.
+
+        Must stay in lockstep with ``CustomAllreduce._fits_custom_ar_size`` in
+        AITER, which admits ``inp_size <= max_size // 2``; otherwise
+        ``_set_compile_ranges`` compiles a fused variant for token counts that
+        the runtime guard then rejects, silently falling back to an unfused
+        allreduce + RMSNorm pair.
         """
         return cls.MAX_SIZE // 2
 
