@@ -12,6 +12,16 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+# Launch-shape tuning for the decode-sized attn_res grid (see attn_res()).
+# CDNA wavefront width; a Triton "warp" on ROCm is one 64-lane wavefront.
+_ATTN_RES_WAVEFRONT = 64
+# 1024 work-items is the maximum AMD workgroup size, i.e. 16 wavefronts.
+_ATTN_RES_MAX_WARPS = 16
+# Row counts below this are decode-shaped: the grid alone cannot fill the GPU.
+_ATTN_RES_DECODE_ROWS = 128
+# Do not widen the workgroup past this few fp32 accumulators per lane.
+_ATTN_RES_MIN_ELEMS_PER_LANE = 4
+
 
 @triton.jit
 def _attn_res_kernel(
@@ -164,6 +174,28 @@ def attn_res(
         block_l, num_warps = 1, 4
     else:
         block_l, num_warps = 4, 8
+
+    block_d = triton.next_power_of_2(hidden_size)
+    # Decode-shaped launches use grid=(num_tokens,), i.e. one workgroup per
+    # sequence in the batch. On a CDNA3/CDNA4 part (256 CUs x 4 SIMDs ~ 1024
+    # SIMDs) a conc-64 decode step therefore resides only num_tokens*num_warps
+    # = 64*8 = 512 wavefronts and leaves roughly half the machine idle, while
+    # each lane carries block_d/(64*num_warps) = 16 fp32 accumulators of the
+    # hidden-dim reduction (high VGPR pressure, 1-2 waves/SIMD). Widening the
+    # workgroup raises wave residency and lowers per-lane register pressure
+    # without changing the tiling or the math. Only the reduction's lane
+    # partitioning changes, so results differ at most by fp reassociation.
+    # attn_res is the most-launched kernel in the model (2 per decoder layer
+    # plus a final one), so this is applied on the decode-shaped path only;
+    # prefill (num_tokens >= 256) already saturates the grid and is untouched.
+    if num_tokens < _ATTN_RES_DECODE_ROWS:
+        # Keep at least _ATTN_RES_MIN_ELEMS_PER_LANE fp32 per lane so we do not
+        # widen a small hidden size into mostly-masked lanes.
+        warps_by_work = max(
+            1, block_d // (_ATTN_RES_WAVEFRONT * _ATTN_RES_MIN_ELEMS_PER_LANE)
+        )
+        num_warps = min(_ATTN_RES_MAX_WARPS, max(num_warps, warps_by_work))
+
     _attn_res_kernel[(num_tokens,)](
         prefix,
         delta,
@@ -186,7 +218,7 @@ def attn_res(
         WRITE_BLOCK=block_write_idx >= 0,
         APPLY_OUTPUT_NORM=output_norm_weight is not None,
         BLOCK_L=block_l,
-        BLOCK_D=triton.next_power_of_2(hidden_size),
+        BLOCK_D=block_d,
         num_warps=num_warps,
         num_stages=2,
     )
