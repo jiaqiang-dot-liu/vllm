@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
+    VLLM_ROCM_AITER_FUSED_AR_1STAGE_MAX_SIZE_KB: int | None = None
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1235,6 +1236,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CudaCommunicator on ROCm. Also enables AITER AG/RS for DP communication.
     "VLLM_ROCM_USE_AITER_CUSTOM_AR": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_CUSTOM_AR", "True").lower() in ("true", "1")
+    ),
+    # Overrides the tensor size (KB, where 1 KB = 1024 bytes) up to which AITER's
+    # fused allreduce+RMSNorm runs as its one-stage kernel at TP<=4.
+    # If unset, use the built-in cap. TP2 and TP8 are unaffected.
+    "VLLM_ROCM_AITER_FUSED_AR_1STAGE_MAX_SIZE_KB": lambda: maybe_convert_int(
+        os.environ.get("VLLM_ROCM_AITER_FUSED_AR_1STAGE_MAX_SIZE_KB", None)
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
