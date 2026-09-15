@@ -4046,6 +4046,25 @@ class GPUModelRunner(
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+        elif self.parallel_config.use_ubatching:
+            # DP == 1 (e.g. pure tensor parallelism). No cross-rank coordination
+            # is needed here: every TP rank sees the same batch shape and so
+            # reaches the same decision, which is what the DP all-reduce is for.
+            # Decide microbatching locally so DBO can overlap the per-layer TP
+            # collectives with the sibling microbatch's compute.
+            num_ubatches = self.parallel_config.num_ubatches
+            should_ubatch = allow_microbatching and check_ubatch_thresholds(
+                self.parallel_config,
+                num_tokens,
+                uniform_decode,
+            )
+            # Mirror is_last_ubatch_empty() from ubatch_utils: if padding would
+            # leave the final microbatch with no real tokens, run unbatched
+            # instead. Inlined to keep this patch import-free.
+            if should_ubatch and (num_tokens_padded // num_ubatches) * (
+                num_ubatches - 1
+            ) >= num_tokens:
+                should_ubatch = False
 
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
