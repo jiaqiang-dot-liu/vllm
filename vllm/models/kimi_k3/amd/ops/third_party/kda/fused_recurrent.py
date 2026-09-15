@@ -7,11 +7,74 @@
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 # ruff: noqa: E501
 
+import os
+
 import torch
 
+from vllm.logger import init_logger
 from vllm.third_party.flash_linear_attention.ops.op import exp, log
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
+
+logger = init_logger(__name__)
+
+_KDA_DECODE_BV_ENV = "VLLM_KDA_DECODE_BV"
+_KDA_DECODE_NUM_WARPS_ENV = "VLLM_KDA_DECODE_NUM_WARPS"
+_KDA_DECODE_VALID_NUM_WARPS = (1, 2, 4, 8, 16)
+
+
+def _env_pow2(name: str, default: int, upper: int) -> int:
+    """Read a power-of-two tile override from the environment.
+
+    Falls back to ``default`` (warning once per bad value) when the variable is
+    unset, unparseable, not a power of two, or outside ``[1, upper]``.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring %s=%r: expected an integer power of two.", name, raw
+        )
+        return default
+    if value < 1 or value > upper or (value & (value - 1)) != 0:
+        logger.warning_once(
+            "Ignoring %s=%d: expected a power of two in [1, %d].", name, value, upper
+        )
+        return default
+    return value
+
+
+def _kda_packed_decode_tile(V: int) -> tuple[int, int]:
+    """Resolve ``(BV, num_warps)`` for the packed KDA decode launch.
+
+    The vendored kernel hard-codes ``BV=min(next_pow2(V), 32)`` and
+    ``num_warps=4`` with no ``triton.autotune`` config, unlike every prefill
+    kernel in this directory. This launch is replayed once per decode step for
+    each of the 69 KDA layers, so the tile shape is worth exposing.
+
+    ``BV`` only partitions the V axis: every reduction in the kernel runs along
+    ``axis=1`` (the K axis, always whole within a workgroup) and each V block
+    owns a disjoint slice of state rows, so no partial sums cross blocks and
+    results stay elementwise equivalent. Raising ``BV`` shrinks the V grid and
+    therefore the number of times the ``i_v``-independent q/k/g/dt_bias vectors
+    (``BK`` elements each) are re-read and the two L2-norm reductions re-run,
+    at the cost of more registers per workgroup.
+
+    The default moves from 32 to 64. For the Kimi-K3 shape (V=K=128) that takes
+    the V grid from 4 to 2, halving those redundant reads, while the state tile
+    stays at 64*128 fp32 = 32 VGPRs/thread at num_warps=4 -- well clear of
+    spilling -- and still leaves 2 V blocks * B * H workgroups to fill the GPU.
+    Set ``VLLM_KDA_DECODE_BV=32`` to restore the historical tile exactly.
+    """
+    v_pow2 = next_power_of_2(V)
+    bv = _env_pow2(_KDA_DECODE_BV_ENV, min(v_pow2, 64), v_pow2)
+    num_warps = _env_pow2(_KDA_DECODE_NUM_WARPS_ENV, 4, 16)
+    if num_warps not in _KDA_DECODE_VALID_NUM_WARPS:
+        num_warps = 4
+    return bv, num_warps
 
 
 @triton.heuristics(
@@ -588,7 +651,7 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError("`state_indices` must contain one entry per token.")
 
     BK = next_power_of_2(K)
-    BV = min(next_power_of_2(V), 32)
+    BV, num_warps = _kda_packed_decode_tile(V)
     if scale is None:
         scale = K**-0.5
 
@@ -617,7 +680,7 @@ def fused_recurrent_kda_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_LOWER_BOUND=lower_bound is not None,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
     )
     return out, initial_state
