@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import IntEnum
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -32,6 +33,27 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 
 if TYPE_CHECKING:
     from aiter import ActivationType
+
+
+@lru_cache(maxsize=1)
+def _aiter_moe_pad_needs_floor_clamp() -> bool:
+    """Whether the legacy hidden/intermediate pad floor-clamp still applies.
+
+    The clamp matches the AITER v0.1.13.post1 CK/FlyDSL MoE dispatch grid.
+    AITER >= 0.1.15 carries the padding fixes (ROCm/aiter#3401) and re-applies
+    the CK-tile floor internally. Any detection failure keeps the conservative
+    legacy behaviour. VLLM_ROCM_AITER_MOE_PAD_FLOOR forces it either way.
+    """
+    override = os.environ.get("VLLM_ROCM_AITER_MOE_PAD_FLOOR")
+    if override is not None:
+        return override.strip().lower() in ("1", "true", "yes")
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        base = _pkg_version("amd-aiter").split("+")[0].split(".post")[0]
+        return tuple(int(x) for x in base.split(".")[:3]) < (0, 1, 15)
+    except Exception:
+        return True
 
 
 class QuantMethod(IntEnum):
@@ -369,7 +391,10 @@ def rocm_aiter_fused_experts(
         # TODO: Revisit this once we bump AITER to 0.1.15 with padding fixes
         # for CK/FlyDSL MoE GEMM e.g. https://github.com/ROCm/aiter/pull/3401
         # SITU's A16W4 FlyDSL kernel pads per gate/up half; pass through unrounded.
-        if activation != MoEActivation.SITU:
+        # AITER >= 0.1.15 re-applies the CK-tile floor internally, so clamping here
+        # is a no-op for CK-tile and under-declares padding to FlyDSL, which takes
+        # inter_dim_pad / model_dim_pad verbatim.
+        if activation != MoEActivation.SITU and _aiter_moe_pad_needs_floor_clamp():
             hidden_pad = hidden_pad // 128 * 128
             intermediate_pad = (
                 intermediate_pad // 64 * 64 * (2 if moe_config.tp_size == 1 else 1)
