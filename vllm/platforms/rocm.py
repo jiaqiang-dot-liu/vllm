@@ -915,6 +915,92 @@ class RocmPlatform(Platform):
         # Default dispatch to rocm's sparse_attn_indexer implementation
         compilation_config.custom_ops.append("+sparse_attn_indexer")
 
+        cls._enable_rope_kvcache_fusion_defaults(vllm_config)
+
+    @classmethod
+    def _enable_rope_kvcache_fusion_defaults(cls, vllm_config: "VllmConfig") -> None:
+        """Make the AITER RoPE + KV-cache-update fusion reachable on ROCm.
+
+        The fusion (vllm/compilation/passes/fusion/rope_kvcache_fusion.py) is
+        gated by ``enable_rope_kvcache_fusion`` on two conditions that ROCm
+        never satisfies with stock defaults, so it is dead code today:
+
+        1. ``is_custom_op_enabled("rotary_embedding")`` - false, because
+           ``custom_ops`` resolves to "none" plus a short allowlist that does
+           not contain rotary_embedding. The fusion pattern matcher keys on
+           that CustomOp, so without it nothing can match.
+        2. ``not splitting_ops_contain_kv_cache_update()`` - false, because
+           ``set_splitting_ops_for_v1`` appends ``vllm::unified_kv_cache_update``
+           to ``splitting_ops`` when the user leaves it unset. That workaround
+           exists only to let Inductor reuse piecewise graphs (a compile-time
+           win) and its own comment notes it excludes the cache update from
+           cudagraphs. Splitting there puts rope and the kv-cache update in
+           different subgraphs, which is why the fusion is then silently
+           dropped with a warning telling the user to set ``splitting_ops``
+           by hand.
+
+        Both are addressed here by pinning ``splitting_ops`` to the attention
+        ops only (the pre-workaround default) and dispatching the rotary
+        CustomOp. Every ROCm v1 attention backend - rocm_aiter_fa,
+        rocm_aiter_unified_attn, rocm_attn and triton_attn - implements
+        ``AttentionImpl.do_rope_and_kv_cache_update``, so the fused op is
+        always serviceable on this platform. The fusion pass only applies to
+        compile ranges up to ``rope_kvcache_fusion_max_token_num`` (256), i.e.
+        exactly the small-batch decode steps that dominate wall clock in
+        high-concurrency serving; larger prefill chunks keep the unfused path.
+
+        Set ``VLLM_ROCM_FUSE_ROPE_KVCACHE=0`` to restore stock behaviour.
+        """
+        from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.config.compilation import CompilationConfig, CompilationMode
+
+        compilation_config = vllm_config.compilation_config
+
+        if os.environ.get("VLLM_ROCM_FUSE_ROPE_KVCACHE", "1") != "1":
+            return
+        if not rocm_aiter_ops.is_enabled():
+            return
+        # ``mode`` is still None here: VllmConfig resolves it right after this
+        # hook (to VLLM_COMPILE for -O1 and above, NONE for -O0). Only act for
+        # configurations that will actually run the Inductor pass pipeline.
+        if (
+            compilation_config.mode is not None
+            and compilation_config.mode != CompilationMode.VLLM_COMPILE
+        ):
+            return
+        if compilation_config.mode is None and int(vllm_config.optimization_level) <= 0:
+            return
+        if compilation_config.use_inductor_graph_partition:
+            # Inductor graph partition already keeps the kv-cache update inside
+            # the compiled graph; only the CustomOp gate needs help.
+            pass
+        elif compilation_config.splitting_ops is None:
+            compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
+        else:
+            # Respect an explicit user-provided splitting_ops. If it still
+            # contains the kv-cache update ops the fusion cannot match, so do
+            # not force the rotary CustomOp on for no reason.
+            if any(
+                op in compilation_config.splitting_ops
+                for op in (
+                    "vllm::unified_kv_cache_update",
+                    "vllm::unified_mla_kv_cache_update",
+                )
+            ):
+                return
+
+        if (
+            "+rotary_embedding" not in compilation_config.custom_ops
+            and "-rotary_embedding" not in compilation_config.custom_ops
+        ):
+            compilation_config.custom_ops.append("+rotary_embedding")
+
+        logger.info_once(
+            "ROCm: enabling AITER RoPE + KV-cache-update fusion "
+            "(splitting_ops pinned to attention ops, +rotary_embedding "
+            "dispatched). Set VLLM_ROCM_FUSE_ROPE_KVCACHE=0 to disable."
+        )
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CUDAGraphMode
