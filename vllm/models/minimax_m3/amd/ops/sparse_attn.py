@@ -193,12 +193,18 @@ def _gqa_sparse_fwd_kernel(
                     + prefix_len
                     - off_sub[None, :]
                 )
-                qk_sub = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, SUB_K), dtype=tl.float32)
-                # causal: q_abs_pos - k_off >= block_start (c)
-                qk_sub += tl.where(off_q_sub[:, None, :] >= c, 0, float("-inf"))
+                # Neither mask depends on the gqa head, so building them into a
+                # [BLOCK_SIZE_Q, BLOCK_SIZE_H, SUB_K] tensor repeats the same
+                # values BLOCK_SIZE_H times. Build the sum once in 2D and
+                # broadcast it into the scores instead. Bit-identical: the terms
+                # are only 0 or -inf, adding 0 leaves a float untouched and
+                # adding -inf yields -inf whatever the order.
+                bias = tl.where(off_q_sub >= c, 0, float("-inf"))  # causal
+                bias += tl.where(pos_mask_sub[None, :], 0, float("-inf"))  # in-range
+                qk_sub = tl.dot(q, k_sub) * sm_scale_log2e
+                qk_sub = tl.reshape(qk_sub, BLOCK_SIZE_Q, BLOCK_SIZE_H, SUB_K)
+                qk_sub += bias[:, None, :]
                 qk_sub = tl.reshape(qk_sub, BLOCK_SIZE_QH, SUB_K)
-                qk_sub += tl.dot(q, k_sub) * sm_scale_log2e
-                qk_sub += tl.where(pos_mask_sub[None, :], 0, float("-inf"))
                 m_ij = tl.maximum(m_i, tl.max(qk_sub, axis=1))
                 p_sub = tl.exp2(qk_sub - m_ij[:, None])
                 l_ij = tl.sum(p_sub, axis=1)
