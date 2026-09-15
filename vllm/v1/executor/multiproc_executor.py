@@ -854,6 +854,11 @@ class WorkerProc:
         """Worker initialization and execution loops.
         This runs a background process"""
 
+        # Apply NUMA binding before anything else allocates host memory, so the
+        # memory policy also covers this worker's pinned staging buffers. No-op
+        # unless the parent requested binding and `numactl` was unavailable.
+        numa_utils.apply_inproc_numa_binding()
+
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
         # processes to terminate without error

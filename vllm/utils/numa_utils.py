@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _NUMACTL_ARGS_ENV = "_VLLM_INTERNAL_NUMACTL_ARGS"
 _NUMACTL_PYTHON_EXECUTABLE_ENV = "_VLLM_INTERNAL_NUMACTL_PYTHON_EXECUTABLE"
+# Binding handed to a child to apply in-process when `numactl` is unavailable.
+_NUMA_INPROC_ENV = "_VLLM_INTERNAL_NUMA_INPROC"
 
 
 @cache
@@ -530,6 +532,23 @@ def configure_subprocess(
             f"Unknown process_kind {process_kind!r}; expected 'worker' or 'EngineCore'."
         )
 
+    from shutil import which
+
+    if which("numactl") is None:
+        # `numactl` is not installed (common in slim ROCm/vLLM images), but
+        # libnuma + sched_setaffinity are still available. Rather than failing
+        # the whole engine, hand the binding to the child process, which
+        # applies it in-process via apply_inproc_numa_binding().
+        logger.info(
+            "numactl binary not found; applying NUMA binding in-process "
+            "in the child (%s). Requested binding: %s",
+            process_kind,
+            numactl_args,
+        )
+        with _set_inproc_numa_env(numactl_args):
+            yield
+        return
+
     executable, debug_str = _get_numactl_executable()
     numactl_args = _resolve_numactl_args(numactl_args)
     if not numactl_args:
@@ -542,6 +561,143 @@ def configure_subprocess(
         _mp_set_executable(executable, debug_str),
     ):
         yield
+
+
+def _parse_cpu_list(cpu_list: str) -> set[int]:
+    """Parse `numactl --physcpubind` / sysfs `cpulist` syntax, e.g. '0-3,8'."""
+    cpus: set[int] = set()
+    for part in cpu_list.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cpus.update(range(int(lo), int(hi) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+def _cpus_of_numa_nodes(nodes: list[int]) -> set[int]:
+    """CPUs belonging to the given NUMA nodes, read from sysfs."""
+    cpus: set[int] = set()
+    for node in nodes:
+        path = Path(f"/sys/devices/system/node/node{node}/cpulist")
+        try:
+            cpus |= _parse_cpu_list(path.read_text())
+        except OSError as e:
+            logger.warning("Could not read %s: %s", path, e)
+    return cpus
+
+
+@contextmanager
+def _set_inproc_numa_env(numactl_args: str):
+    """Publish the requested binding for the child to apply in-process."""
+    old = os.environ.get(_NUMA_INPROC_ENV)
+    os.environ[_NUMA_INPROC_ENV] = numactl_args
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(_NUMA_INPROC_ENV, None)
+        else:
+            os.environ[_NUMA_INPROC_ENV] = old
+
+
+def apply_inproc_numa_binding(label: str = "worker") -> None:
+    """Apply the NUMA binding requested by the parent, without `numactl`.
+
+    Called at the very top of a spawned worker so that the CPU affinity and
+    the memory policy are in effect before the process allocates its host-side
+    buffers (pinned staging buffers, block tables, sampling scratch), which is
+    where cross-socket traffic on the per-step critical path comes from.
+
+    This is best-effort: any failure is logged and the worker continues
+    unbound, exactly as if NUMA binding had not been requested.
+    """
+    numactl_args = os.environ.pop(_NUMA_INPROC_ENV, None)
+    if not numactl_args:
+        return
+
+    physcpubind: str | None = None
+    cpunodebind: list[int] = []
+    membind: list[int] = []
+    for token in numactl_args.split():
+        if token.startswith("--physcpubind="):
+            physcpubind = token.split("=", 1)[1]
+        elif token.startswith("--cpunodebind="):
+            cpunodebind = [int(n) for n in token.split("=", 1)[1].split(",") if n]
+        elif token.startswith("--membind="):
+            membind = [int(n) for n in token.split("=", 1)[1].split(",") if n]
+
+    # 1) CPU affinity.
+    try:
+        if physcpubind is not None:
+            cpus = _parse_cpu_list(physcpubind)
+        else:
+            cpus = _cpus_of_numa_nodes(cpunodebind)
+        # Never widen beyond, or step outside, the affinity we already have.
+        allowed = os.sched_getaffinity(0)
+        cpus &= allowed
+        if cpus:
+            os.sched_setaffinity(0, cpus)
+            logger.info(
+                "NUMA binding (%s): CPU affinity %d -> %d CPUs (%s)",
+                label,
+                len(allowed),
+                len(cpus),
+                physcpubind
+                if physcpubind is not None
+                else f"nodes {cpunodebind}",
+            )
+        else:
+            logger.warning(
+                "NUMA binding (%s): resolved CPU set is empty; leaving "
+                "affinity unchanged.",
+                label,
+            )
+    except (OSError, ValueError) as e:
+        logger.warning("NUMA binding (%s): could not set CPU affinity: %s", label, e)
+
+    # 2) Memory policy.
+    if not membind:
+        return
+    try:
+        libnuma = get_libnuma()
+        if libnuma is None or libnuma.numa_available() < 0:
+            logger.warning(
+                "NUMA binding (%s): libnuma unavailable; memory policy not set.",
+                label,
+            )
+            return
+        # Drop nodes this host does not have; libnuma would otherwise emit a
+        # `set_mempolicy: Invalid argument` to stderr and leave the policy
+        # untouched.
+        max_node = libnuma.numa_max_node()
+        nodes = [n for n in membind if 0 <= n <= max_node]
+        if not nodes:
+            logger.warning(
+                "NUMA binding (%s): none of the requested membind nodes %s "
+                "exist on this host (max node %d); memory policy not set.",
+                label,
+                membind,
+                max_node,
+            )
+            return
+        libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
+        mask = ctypes.c_void_p(libnuma.numa_allocate_nodemask())
+        try:
+            libnuma.numa_bitmask_clearall(mask)
+            for node in nodes:
+                libnuma.numa_bitmask_setbit(mask, ctypes.c_uint(node))
+            libnuma.numa_set_membind(mask)
+        finally:
+            # `numa_bitmask_free` is the portable name; `numa_free_nodemask`
+            # is not exported by every libnuma build.
+            libnuma.numa_bitmask_free(mask)
+        logger.info("NUMA binding (%s): membind set to nodes %s", label, nodes)
+    except Exception as e:
+        logger.warning("NUMA binding (%s): could not set memory policy: %s", label, e)
 
 
 def _get_numactl_executable() -> tuple[str, str]:
