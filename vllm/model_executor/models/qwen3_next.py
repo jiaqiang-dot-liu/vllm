@@ -375,10 +375,17 @@ class Qwen3NextAttention(nn.Module):
             torch.float16,
             torch.bfloat16,
         )
+        # fused_qk_rmsnorm_rope_gate is a portable Triton kernel and reads the
+        # non-contiguous fused-QKV slices in place via their strides. The eager
+        # fallback instead materialises two reshape copies of q and gate (their
+        # views carry the full qkv row stride, so reshape cannot alias) plus two
+        # RMSNorms and a RoPE, so gating this to CUDA cost ROCm 5 launches and 2
+        # large strided copies per full-attention layer for no reason.
+        platform_ok = current_platform.is_cuda() or current_platform.is_rocm()
         self.use_fused_qk_norm_rope_gate = (
             self.attn_output_gate
             and getattr(self.rotary_emb, "is_neox_style", False)
-            and current_platform.is_cuda()
+            and platform_ok
             and supports_dtype
             and (text_only or supports_mrope)
         )
