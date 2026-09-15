@@ -11,6 +11,7 @@ the fused allreduce+RMSNorm path share a single AITER instance with its IPC buff
 import torch
 from torch.distributed import ProcessGroup
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -19,6 +20,13 @@ logger = init_logger(__name__)
 class AiterCustomAllreduce:
     # Default IPC buffer size for AITER's CustomAllreduce.
     MAX_SIZE: int = 8192 * 1024 * 8 * 2
+
+    # Byte cap up to which the fused allreduce+RMSNorm runs one-stage at TP<=4.
+    # Inherited from the unfused custom-allreduce size table; the guards above it
+    # in use_1stage_fused_ar_rms already bound the tensor at 80 * 8192 * 2 ==
+    # 1.25 MiB, so this is a perf heuristic rather than a buffer bound, and where
+    # one-stage stops winning is hardware-specific. Overridable for that reason.
+    FUSED_AR_1STAGE_MAX_SIZE_TP4: int = 256 * 1024
 
     @classmethod
     def effective_max_size(cls) -> int:
@@ -41,6 +49,20 @@ class AiterCustomAllreduce:
             max_size = self.MAX_SIZE
 
         self._impl = _AiterCustomAllreduce(group, device, max_size=max_size)
+
+        override_kb = envs.VLLM_ROCM_AITER_FUSED_AR_1STAGE_MAX_SIZE_KB
+        self._fused_ar_1stage_max_size_tp4 = (
+            self.FUSED_AR_1STAGE_MAX_SIZE_TP4
+            if override_kb is None
+            else override_kb * 1024
+        )
+        if override_kb is not None:
+            logger.info(
+                "One-stage fused allreduce+RMSNorm TP<=4 cap set to %d KiB "
+                "(default %d KiB)",
+                override_kb,
+                self.FUSED_AR_1STAGE_MAX_SIZE_TP4 // 1024,
+            )
 
     @property
     def aiter_ca(self):
@@ -80,7 +102,8 @@ class AiterCustomAllreduce:
         the fused op runs the two-stage variant (cross-device reduce-scatter
         + local norm), which is slower than an explicit ``all_reduce`` + norm,
         so callers that can fall back should require this. Capture-static:
-        depends only on shape, dtype, TP size and topology.
+        depends only on shape, dtype, TP size, topology, and a cap resolved at
+        construction.
         """
         hidden_dim = inp.shape[-1]
         # Token cap first: prefill-sized inputs leave here with one comparison.
@@ -99,7 +122,7 @@ class AiterCustomAllreduce:
             return False
         total_bytes = inp.numel() * inp.element_size()
         if world_size <= 4:
-            return total_bytes < 256 * 1024
+            return total_bytes < self._fused_ar_1stage_max_size_tp4
         if world_size <= 8:
             return total_bytes < 128 * 1024
         return False
