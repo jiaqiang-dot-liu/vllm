@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -218,6 +219,32 @@ class CustomAllreduce:
                     CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability_str][world_size],
                     max_size,
                 )
+        # Allow the (otherwise hard-coded 8 MiB) custom all-reduce cap to be
+        # raised. On ROCm the CUSTOM_ALL_REDUCE_MAX_SIZES clamp above is
+        # unreachable (gated on is_cuda()), so without this there is no way to
+        # keep a large TP prefill all-reduce off RCCL. Cost is two IPC buffers
+        # of this size per rank: set it just above the largest live message.
+        _env_max_size_mb = os.environ.get("VLLM_CUSTOM_AR_MAX_SIZE_MB")
+        if _env_max_size_mb:
+            try:
+                _mb = int(_env_max_size_mb)
+            except ValueError:
+                logger.warning(
+                    "Ignoring VLLM_CUSTOM_AR_MAX_SIZE_MB=%r: not an integer.",
+                    _env_max_size_mb,
+                )
+            else:
+                if _mb < 1:
+                    logger.warning(
+                        "Ignoring VLLM_CUSTOM_AR_MAX_SIZE_MB=%d: must be >= 1.", _mb
+                    )
+                else:
+                    max_size = _mb * 1024 * 1024
+                    logger.info(
+                        "Custom allreduce max size overridden to %d MiB via "
+                        "VLLM_CUSTOM_AR_MAX_SIZE_MB.",
+                        _mb,
+                    )
         # device.index is a visible ordinal, not a logical local ID.
         fully_connected = False
         if same_node:
