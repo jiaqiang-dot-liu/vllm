@@ -16,6 +16,13 @@ import regex as re
 # tensor is loaded and sliced later by RoutedExperts.weight_loader.
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
 
+# Heavy per-expert payload suffixes, safe to skip on non-owning ranks.
+# ".weight" is bf16/unquantized, ".weight_packed" is compressed-tensors
+# (MXFP4/NVFP4/FP8), ".qweight" is AWQ/GPTQ. Scale and metadata tensors
+# (".weight_scale", ".weight_scale_inv", ".weight_shape",
+# ".weight_zero_point") are deliberately absent -- see should_skip_weight.
+_HEAVY_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".qweight")
+
 
 def parse_expert_id(weight_name: str) -> int | None:
     """Return the expert id embedded in *weight_name*, or ``None`` if it is
@@ -76,6 +83,6 @@ def should_skip_weight(
     # Only skip heavy weight tensors, never scale/metadata tensors.
     # Scale tensors are tiny and some backends need them from ALL experts
     # (e.g. FlashInfer NVFP4 computes a global max of activation scales).
-    if not weight_name.endswith((".weight", ".weight_packed")):
+    if not weight_name.endswith(_HEAVY_WEIGHT_SUFFIXES):
         return False
     return eid not in local_expert_ids
