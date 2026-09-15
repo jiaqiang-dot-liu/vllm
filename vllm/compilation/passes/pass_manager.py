@@ -48,9 +48,17 @@ if current_platform.is_cuda_alike():
     from .fusion.rope_kvcache_fusion import RopeKVCacheFusionPass
     from .utility.scatter_split_replace import ScatterSplitReplacementPass
 
-if current_platform.is_cuda():
-    from .fusion.allreduce_rms_fusion import AllReduceFusionPass
-    from .fusion.collective_fusion import AsyncTPPass
+# NOTE: `AllReduceFusionPass` and `AsyncTPPass` are referenced unconditionally
+# from `PostGradPassManager.configure()` (see the `fuse_gemm_comms` and
+# `fuse_allreduce_rms` branches below), but used to be imported only under
+# `current_platform.is_cuda()`. On ROCm that made
+# `-O.pass_config.fuse_gemm_comms=true` abort engine startup with
+# `NameError: name 'AsyncTPPass' is not defined`, and likewise
+# `fuse_allreduce_rms=true` with AITER disabled. Both modules import cleanly on
+# ROCm, so hoist the imports out of the platform guard and let `configure()`
+# remain the single place that decides whether a pass is actually used.
+from .fusion.allreduce_rms_fusion import AllReduceFusionPass
+from .fusion.collective_fusion import AsyncTPPass
 
 if current_platform.is_xpu():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
