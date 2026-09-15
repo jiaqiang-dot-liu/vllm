@@ -206,7 +206,40 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             local_output_size = (
                 4 * self.local_projection_size + self.head_dim + self.local_num_heads
             )
-            self.in_proj_padding = -local_output_size % 16
+            # gfx950 (MI355X) tile-alignment fix.
+            #
+            # Padding the merged in_proj row count only to 16 leaves, for
+            # Kimi-K3 at TP8, N = 4*1536 + 128 + 12 = 6284 -> 6288 = 16 * 393.
+            # 393 is odd, so N is NOT a multiple of 64/128/256 and every tuned
+            # BF16 GEMM path this projection could take rejects the shape:
+            #   * aiter/ops/flydsl/kernels/small_m_hgemm.py asserts
+            #     `n % BLOCK_N == 0` (BLOCK_N is 64/128/256 in the tuned
+            #     small-M catalog), so aiter.tuned_gemm's flydsl candidates are
+            #     unusable;
+            #   * aiter/tuned_gemm.py's bpreshuffle default requires
+            #     `N % 64 == 0` before it will pick the `asm` library;
+            #   * hipBLASLt likewise only reaches its widest N tiles on an
+            #     aligned N and otherwise runs a ragged final tile column.
+            # The result is that all 69 KDA layers fall back to a generic GEMM.
+            #
+            # Widening the pad to 256 gives N = 6400 = 256 * 25 (also a
+            # multiple of 64 and 128). Cost is 116 extra zeroed output rows out
+            # of 6284 (+1.85% of this one projection's FLOPs, ~114 MiB of
+            # weights per rank across 69 layers); the extra columns are split
+            # off and discarded in forward() and the rows are zeroed below, so
+            # every consumed output is bit-identical.
+            #
+            # Override with VLLM_KDA_IN_PROJ_ALIGN (power of two, >= 16); set
+            # it to 16 to restore the previous behaviour.
+            import os as _os
+
+            try:
+                _align = int(_os.getenv("VLLM_KDA_IN_PROJ_ALIGN", "256"))
+            except ValueError:
+                _align = 256
+            if _align < 16 or (_align & (_align - 1)) != 0:
+                _align = 256
+            self.in_proj_padding = -local_output_size % _align
             if self.in_proj_padding:
                 in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
         else:
