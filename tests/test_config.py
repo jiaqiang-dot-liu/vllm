@@ -148,6 +148,160 @@ def test_rocm_mm_prefix_lm_disables_chunked_mm_input(
     assert config.scheduler_config.disable_chunked_mm_input is expected
 
 
+_KV_UPDATE_SPLIT = [
+    "vllm::unified_attention_with_output",
+    "vllm::unified_kv_cache_update",
+    "vllm::unified_mla_kv_cache_update",
+]
+
+
+def _apply_rocm_rope_kvcache_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    aiter: bool,
+    layer_name_hoisted: bool,
+    level: int,
+    compilation_config: CompilationConfig,
+) -> SimpleNamespace:
+    import vllm.utils.torch_utils as torch_utils
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.platforms.rocm import RocmPlatform
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", classmethod(lambda cls: aiter))
+    monkeypatch.setattr(torch_utils, "_USE_LAYERNAME", layer_name_hoisted)
+    config = SimpleNamespace(
+        compilation_config=compilation_config,
+        optimization_level=vllm_config_module.OptimizationLevel(level),
+    )
+    RocmPlatform._enable_rope_kvcache_fusion_defaults(config)
+    # VllmConfig adds the custom-op base mode right after the platform hook.
+    compilation_config.custom_ops.append("none")
+    return config
+
+
+def _resolved_fusions(config: SimpleNamespace) -> tuple[bool, bool]:
+    """(fuse_rope_kvcache, fuse_qk_norm_rope_kvcache) as the -O defaults
+    resolve them: an explicit value wins, -O2 and above call the resolver."""
+    pass_config = config.compilation_config.pass_config
+    level = vllm_config_module.OptimizationLevel
+    on_by_default = config.optimization_level >= level.O2
+
+    def resolve(value: bool | None, resolver) -> bool:
+        if value is not None:
+            return value
+        return on_by_default and resolver(config)
+
+    return (
+        resolve(
+            pass_config.fuse_rope_kvcache, vllm_config_module.enable_rope_kvcache_fusion
+        ),
+        resolve(
+            pass_config.fuse_qk_norm_rope_kvcache,
+            vllm_config_module.enable_qk_norm_rope_kvcache,
+        ),
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")
+@pytest.mark.parametrize(
+    ("aiter", "level", "compilation_kwargs", "expected"),
+    [
+        pytest.param(True, 2, {}, (True, False), id="O2-default"),
+        pytest.param(True, 1, {}, (False, False), id="O1-default"),
+        pytest.param(False, 2, {}, (False, False), id="aiter-off"),
+        pytest.param(
+            True,
+            2,
+            {"mode": CompilationMode.NONE},
+            (False, False),
+            id="compile-disabled",
+        ),
+        pytest.param(
+            True,
+            2,
+            {
+                "pass_config": PassConfig(
+                    fuse_rope_kvcache=False, fuse_qk_norm_rope_kvcache=False
+                )
+            },
+            (False, False),
+            id="fusions-disabled",
+        ),
+        pytest.param(
+            True,
+            1,
+            {"pass_config": PassConfig(fuse_qk_norm_rope_kvcache=True)},
+            (False, True),
+            id="O1-qk-norm-requested",
+        ),
+        pytest.param(
+            True,
+            2,
+            {"pass_config": PassConfig(fuse_qk_norm_rope_kvcache=True)},
+            (True, True),
+            id="O2-qk-norm-requested",
+        ),
+        pytest.param(
+            True,
+            2,
+            {"custom_ops": ["-rotary_embedding"]},
+            (False, False),
+            id="rotary-disabled",
+        ),
+        pytest.param(True, 2, {"splitting_ops": []}, (True, False), id="no-splitting"),
+        pytest.param(
+            True,
+            2,
+            {"splitting_ops": list(_KV_UPDATE_SPLIT)},
+            (False, False),
+            id="user-splits-kv-update",
+        ),
+    ],
+)
+def test_rocm_rope_kvcache_fusion_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    aiter: bool,
+    level: int,
+    compilation_kwargs: dict,
+    expected: tuple[bool, bool],
+) -> None:
+    compilation_config = CompilationConfig(**compilation_kwargs)
+    user_splitting_ops = compilation_config.splitting_ops
+
+    config = _apply_rocm_rope_kvcache_defaults(
+        monkeypatch,
+        aiter=aiter,
+        layer_name_hoisted=True,
+        level=level,
+        compilation_config=compilation_config,
+    )
+
+    assert _resolved_fusions(config) == expected
+    assert compilation_config.is_custom_op_enabled("rotary_embedding") is any(expected)
+    if user_splitting_ops is not None:
+        assert compilation_config.splitting_ops == user_splitting_ops
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-specific test")
+def test_rocm_rope_kvcache_fusion_defaults_need_hoisted_layer_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without layer_name hoisting, keeping the KV-cache update in the graph
+    breaks piecewise-graph reuse, so the defaults must stay untouched."""
+    compilation_config = CompilationConfig()
+
+    config = _apply_rocm_rope_kvcache_defaults(
+        monkeypatch,
+        aiter=True,
+        layer_name_hoisted=False,
+        level=2,
+        compilation_config=compilation_config,
+    )
+
+    assert compilation_config.splitting_ops is None
+    assert _resolved_fusions(config) == (False, False)
+
+
 def _sampling_replay_config(
     *,
     return_sampling_mask: bool = True,

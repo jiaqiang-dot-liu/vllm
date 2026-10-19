@@ -1111,6 +1111,79 @@ class RocmPlatform(Platform):
         # Default dispatch to rocm's sparse_attn_indexer implementation
         compilation_config.custom_ops.append("+sparse_attn_indexer")
 
+        cls._enable_rope_kvcache_fusion_defaults(vllm_config)
+
+    @classmethod
+    def _enable_rope_kvcache_fusion_defaults(cls, vllm_config: "VllmConfig") -> None:
+        """Enable the AITER RoPE + KV-cache-update fusion by default.
+
+        ``fuse_rope_kvcache`` and ``fuse_qk_norm_rope_kvcache`` need the
+        ``rotary_embedding`` CustomOp, which the ``"none"`` custom-op base mode
+        never dispatches on ROCm, and a ``splitting_ops`` list without the
+        KV-cache-update ops, which ``set_splitting_ops_for_v1`` appends when
+        ``splitting_ops`` is unset. Either gap turns both fusions off, including
+        when they are requested explicitly. This hook runs before the
+        optimization-level defaults are resolved, so closing both gaps here lets
+        ``fuse_rope_kvcache`` default on and makes an explicit
+        ``fuse_qk_norm_rope_kvcache`` request take effect. Explicit user settings
+        are left alone.
+
+        Keeping the KV-cache update inside the compiled graph is only cheap when
+        ``layer_name`` is hoisted as a graph input; otherwise Inductor can no
+        longer reuse the piecewise graphs, so the defaults are left unchanged.
+        """
+        from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.config.compilation import CompilationConfig, CompilationMode
+        from vllm.config.vllm import OptimizationLevel
+        from vllm.utils.torch_utils import _USE_LAYERNAME
+
+        compilation_config = vllm_config.compilation_config
+        pass_config = compilation_config.pass_config
+
+        if not rocm_aiter_ops.is_enabled() or not _USE_LAYERNAME:
+            return
+        if compilation_config.mode is None:
+            if vllm_config.optimization_level == OptimizationLevel.O0:
+                return
+        elif compilation_config.mode != CompilationMode.VLLM_COMPILE:
+            return
+
+        fusion_flags = (
+            pass_config.fuse_rope_kvcache,
+            pass_config.fuse_qk_norm_rope_kvcache,
+        )
+        requested = True in fusion_flags
+        on_by_default = (
+            None in fusion_flags
+            and vllm_config.optimization_level >= OptimizationLevel.O2
+        )
+        if not (requested or on_by_default):
+            return
+        if "-rotary_embedding" in compilation_config.custom_ops:
+            return
+
+        if (
+            compilation_config.splitting_ops is None
+            and not compilation_config.use_inductor_graph_partition
+            and not pass_config.fuse_attn_quant
+        ):
+            compilation_config.splitting_ops = list(CompilationConfig._attention_ops)
+        if compilation_config.splitting_ops_contain_kv_cache_update():
+            return
+
+        if "+rotary_embedding" not in compilation_config.custom_ops:
+            compilation_config.custom_ops.append("+rotary_embedding")
+        # Dispatching the CustomOp would also resolve the QK-norm fusion on by
+        # default. Keep it opt-in: it switches ROCM_ATTN layers to the
+        # interleaved V cache, which the RoPE + KV-cache fusion cannot write, so
+        # models without QK-norm would lose that fusion.
+        if pass_config.fuse_qk_norm_rope_kvcache is None:
+            pass_config.fuse_qk_norm_rope_kvcache = False
+        logger.info_once(
+            "ROCm: dispatching the rotary_embedding CustomOp so the AITER "
+            "RoPE + KV-cache-update fusion can apply."
+        )
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CUDAGraphMode
