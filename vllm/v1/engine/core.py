@@ -53,7 +53,11 @@ from vllm.utils.gc_utils import (
 )
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
-from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.utils.system_utils import (
+    decorate_logs,
+    set_parent_death_signal,
+    set_process_title,
+)
 from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core import kv_cache_utils
@@ -1634,6 +1638,13 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
+        # Die with the parent process even if it is SIGKILLed. The engine core
+        # is deliberately not a daemon process, so nothing else reaps it, and
+        # an orphaned engine core keeps its whole worker tree - and their GPU
+        # memory - alive. SIGTERM is handled below, so the usual graceful
+        # shutdown path still runs.
+        set_parent_death_signal(signal.SIGTERM)
+
         vllm_config: VllmConfig = kwargs["vllm_config"]
         if logging_config := getattr(vllm_config, "logging_config", None):
             configure_logging(logging_config)

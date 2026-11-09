@@ -59,6 +59,7 @@ from vllm.utils.system_utils import (
     _maybe_force_spawn,
     decorate_logs,
     get_mp_context,
+    set_parent_death_signal,
     set_process_title,
 )
 from vllm.utils.torch_utils import (
@@ -996,6 +997,16 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
+        # Die with the parent engine core even if it is SIGKILLed. The
+        # death_pipe monitor installed further down covers the graceful case,
+        # but it is only started once WorkerProc.__init__ returns: a worker
+        # still inside init_device()/load_model() - minutes, for a large
+        # checkpoint - never observes the closed pipe, and if the engine core
+        # was SIGKILLed nothing sends SIGTERM either. The worker is then
+        # reparented to init and holds its device context and its shared
+        # memory segments for as long as it lives.
+        set_parent_death_signal(signal.SIGTERM)
+
         if logging_config := getattr(kwargs["vllm_config"], "logging_config", None):
             configure_logging(logging_config)
 
