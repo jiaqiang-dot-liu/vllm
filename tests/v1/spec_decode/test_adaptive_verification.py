@@ -185,6 +185,21 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert num_non_draft_tokens == {"low": 1, "high": 1}
 
 
+def test_profiled_batches_route_dummy_tokens():
+    """Every calibration batch must route its dummy tokens to the experts.
+
+    Dummy rows are padding by default, so an MoE target would otherwise price
+    verification with no token routed to any expert.
+    """
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)
+
+    batches = list(manager.batches_to_profile([8, 1024]))
+
+    assert batches
+    assert all(batch["route_dummy_tokens"] for batch in batches)
+
+
 def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)

@@ -893,6 +893,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        route_dummy_tokens: bool = False,
         num_active_loras: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -973,6 +974,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 randomize_inputs=randomize_inputs,
+                route_dummy_tokens=route_dummy_tokens,
             )
         self.kv_connector.set_disabled(False)
 
@@ -1826,6 +1828,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        route_dummy_tokens: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             self.draft_tokens_handler.begin_step(scheduler_output)
@@ -1948,9 +1951,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_query_len=batch_desc.max_query_len,
                 # Profiling and warmup must route the dummy tokens to experts
                 # so MoE memory is measured and MoE kernels are exercised.
-                is_padding=not is_profile,
+                # Step-cost profiling must too, or the MoE cost it measures is
+                # the cost of routing no tokens at all.
+                is_padding=not (is_profile or route_dummy_tokens),
             )
-            if randomize_inputs:
+            if route_dummy_tokens:
+                # Seeded per batch size so the measured cost is reproducible
+                # and every rank routes the same tokens to the same experts.
+                generator = torch.Generator(device=input_batch.input_ids.device)
+                generator.manual_seed(batch_desc.num_tokens)
+                input_batch.input_ids.random_(0, self.vocab_size, generator=generator)
+            elif randomize_inputs:
                 # All-zero input_ids route every token to the same experts.
                 input_batch.input_ids.random_(0, self.vocab_size)
             if self.pcp_manager is not None:
@@ -2049,6 +2060,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 inputs_embeds = self.model_state.dummy_inputs_embeds(
                     input_batch.num_tokens_after_padding
                 )
+                if route_dummy_tokens and inputs_embeds is not None:
+                    # The buffer holds whatever the last run left in it (zeros
+                    # at startup), which makes every token identical to the
+                    # router again. Embed the dummy ids instead.
+                    num_embed_tokens = input_batch.input_ids.shape[0]
+                    inputs_embeds[:num_embed_tokens].copy_(
+                        self.model.embed_input_ids(input_batch.input_ids)
+                    )
             else:
                 scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
                 if self.supports_mm_inputs and self.lora_config is not None:
