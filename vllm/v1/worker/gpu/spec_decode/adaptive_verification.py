@@ -302,7 +302,9 @@ class AdaptiveVerificationManager:
         self._pending_resets.append(req_idx)
         self._confidence_probs[req_idx].fill_(1.0)
 
-    def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
+    def batches_to_profile(
+        self, capture_sizes: list[int]
+    ) -> Iterator[dict[str, int | bool]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
 
         Run these inside StepTimingCollector.collect(), then hand the block's
@@ -324,6 +326,11 @@ class AdaptiveVerificationManager:
                 yield {
                     "num_tokens": num_tokens,
                     "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+                    # Route the dummy tokens like real ones. Dummy rows are
+                    # padding by default, so an MoE target's verify cost would
+                    # otherwise be measured with no token routed to any expert,
+                    # leaving the curve flat in the token count.
+                    "route_dummy_tokens": True,
                 }
 
     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
