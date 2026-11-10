@@ -260,6 +260,101 @@ def kill_process_tree(pid: int):
         os.kill(pid, signal.SIGKILL)
 
 
+# PR_SET_PDEATHSIG, from <linux/prctl.h>. See prctl(2).
+_PR_SET_PDEATHSIG = 1
+
+# Signal the kernel uses to tell a child that its parent died. A real-time
+# signal keeps this notification distinguishable from a shutdown request sent
+# by a user or by vLLM itself; glibc reserves the two signals below SIGRTMIN
+# for its threading implementation, so SIGRTMIN is the first one free for
+# applications.
+_PARENT_DEATH_NOTIFY_SIG = getattr(signal, "SIGRTMIN", None)
+
+
+def _parent_is_gone(original_ppid: int) -> bool:
+    """Whether we have been reparented away from `original_ppid`."""
+    # A parent pid of 1 is not evidence of anything: inside a container the
+    # real parent may well be the init process.
+    return original_ppid != 1 and os.getppid() != original_ppid
+
+
+def set_parent_death_signal(sig: int = signal.SIGTERM) -> None:
+    """Send `sig` to this process when its parent process dies.
+
+    `prctl(PR_SET_PDEATHSIG)` is the only parent-death notification that still
+    works when the parent is killed with SIGKILL - by the OOM killer, by a
+    `kill -9`, or by a job scheduler tearing down a run - which is precisely
+    the case in which the parent cannot clean up after itself. Without it the
+    child is reparented to init and keeps running, holding its GPU memory, its
+    device handles and its shared-memory segments until someone notices and
+    kills it by hand.
+
+    Call this from the child process once it is running, on its main thread:
+    the setting is cleared by fork(), and `signal.signal` is main-thread only.
+
+    The kernel notification is delivered to a dedicated signal rather than to
+    `sig` directly, because `PR_SET_PDEATHSIG` tracks the *thread* that created
+    this process, not the parent process: it also fires when that thread exits
+    while the parent lives on, which happens if an embedding application builds
+    its engine from a short-lived thread. The handler therefore checks whether
+    we really were reparented and ignores the notification if we were not. The
+    kernel only notifies once, so after such a spurious wake-up this process is
+    no longer protected - no worse than not arming the signal at all.
+
+    No-op on platforms other than Linux.
+    """
+    if sys.platform != "linux" or _PARENT_DEATH_NOTIFY_SIG is None:
+        return
+
+    original_ppid = os.getppid()
+
+    def handle_parent_death(signum, frame):
+        if not _parent_is_gone(original_ppid):
+            logger.debug(
+                "Ignoring parent-death notification: the thread that spawned "
+                "this process exited but parent %d is still alive.",
+                original_ppid,
+            )
+            return
+        logger.warning(
+            "Parent process %d exited; terminating self (pid %d).",
+            original_ppid,
+            os.getpid(),
+        )
+        os.kill(os.getpid(), sig)
+
+    try:
+        signal.signal(_PARENT_DEATH_NOTIFY_SIG, handle_parent_death)
+    except ValueError:
+        # Not the main thread; leaving the signal unarmed is the safe choice.
+        logger.warning(
+            "set_parent_death_signal() must be called from the main thread; "
+            "this process may outlive its parent."
+        )
+        return
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_PDEATHSIG, _PARENT_DEATH_NOTIFY_SIG, 0, 0, 0) != 0:
+        logger.warning(
+            "prctl(PR_SET_PDEATHSIG) failed: %s. This process may outlive its "
+            "parent if the parent dies abnormally.",
+            os.strerror(ctypes.get_errno()),
+        )
+        signal.signal(_PARENT_DEATH_NOTIFY_SIG, signal.SIG_DFL)
+        return
+
+    # prctl() only covers parent deaths that happen after the call above, so
+    # re-check: a parent that died while we were starting up is missed.
+    if _parent_is_gone(original_ppid):
+        logger.warning(
+            "Parent process %d exited while starting up; terminating self "
+            "(pid %d) rather than leaking an orphan holding device memory.",
+            original_ppid,
+            os.getpid(),
+        )
+        os.kill(os.getpid(), sig)
+
+
 # Resource utilities
 
 

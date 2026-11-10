@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import psutil
@@ -129,3 +130,120 @@ raise SystemExit(1 if hung else proc.exitcode)
     env = os.environ | {"VLLM_WORKER_MULTIPROC_METHOD": "fork"}
     result = subprocess.run([sys.executable, "-c", script], env=env, timeout=120)
     assert result.returncode == 0
+
+
+# A process that arms the parent-death signal and then idles. `mode` controls
+# which thread spawns it and whether it arms before or after its parent dies.
+_PARENT_DEATH_LAUNCHER = """
+import os
+import subprocess
+import sys
+import threading
+import time
+
+child_script = '''
+import signal, sys, time
+from vllm.utils.system_utils import set_parent_death_signal
+time.sleep(float(sys.argv[1]))
+set_parent_death_signal(signal.SIGTERM)
+print("armed", flush=True)
+time.sleep(600)
+'''
+
+mode = sys.argv[1]
+pid_file = sys.argv[2]
+arm_delay = "2" if mode == "late_arm" else "0"
+
+
+def spawn():
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_script, arm_delay], stdout=subprocess.PIPE
+    )
+    if mode != "late_arm":
+        # Wait until the child has armed the signal.
+        proc.stdout.readline()
+    with open(pid_file, "w") as f:
+        f.write(str(proc.pid))
+
+
+if mode == "thread":
+    thread = threading.Thread(target=spawn)
+    thread.start()
+    thread.join()
+else:
+    spawn()
+
+if mode == "late_arm":
+    # Exit while the child is still starting up, before it arms the signal.
+    raise SystemExit(0)
+time.sleep(600)
+"""
+
+
+def _wait_gone(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not psutil.pid_exists(pid):
+            return True
+        with contextlib.suppress(psutil.Error):
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return True
+        time.sleep(0.05)
+    return False
+
+
+@contextlib.contextmanager
+def _parent_death_child(mode: str, tmp_path: Path):
+    """Run the launcher in `mode` and yield (launcher, child pid)."""
+    pid_file = tmp_path / "child.pid"
+    child_pid = None
+    launcher = subprocess.Popen(
+        [sys.executable, "-c", _PARENT_DEATH_LAUNCHER, mode, str(pid_file)]
+    )
+    try:
+        deadline = time.monotonic() + 120
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert pid_file.exists(), "child never reported its pid"
+        child_pid = int(pid_file.read_text())
+        yield launcher, child_pid
+    finally:
+        for pid in (launcher.pid, child_pid):
+            if pid is not None:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+        launcher.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="prctl is Linux only")
+def test_set_parent_death_signal_terminates_orphan(tmp_path):
+    """SIGKILLing a process takes down a child that armed the signal."""
+    with _parent_death_child("direct", tmp_path) as (launcher, child_pid):
+        assert psutil.pid_exists(child_pid)
+        launcher.kill()
+        assert _wait_gone(child_pid, timeout=30), (
+            "child survived the death of its parent"
+        )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="prctl is Linux only")
+def test_set_parent_death_signal_handles_parent_that_already_died(tmp_path):
+    """The parent dying *while* the child arms the signal is still caught."""
+    with _parent_death_child("late_arm", tmp_path) as (launcher, child_pid):
+        # The launcher exits on its own here, orphaning the child before it
+        # gets to call prctl().
+        launcher.wait(timeout=30)
+        assert _wait_gone(child_pid, timeout=30), (
+            "child survived being orphaned during start-up"
+        )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="prctl is Linux only")
+def test_set_parent_death_signal_survives_spawning_thread_exit(tmp_path):
+    """PR_SET_PDEATHSIG tracks the spawning thread, which may exit long before
+    the parent process does; that must not take the child down."""
+    with _parent_death_child("thread", tmp_path) as (launcher, child_pid):
+        assert not _wait_gone(child_pid, timeout=5), (
+            "child was killed when the thread that spawned it exited"
+        )
+        assert launcher.poll() is None
