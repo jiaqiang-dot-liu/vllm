@@ -346,6 +346,100 @@ def test_wait_for_engine_startup_reports_watched_process_exit():
     assert "Failed frontend proc(s): {'RustFrontend': 1}" in str(exc_info.value)
 
 
+class _UnreapedProcess:
+    """Process whose exit status only becomes available after a few checks.
+
+    A sentinel becomes readable as soon as the process dies, but `exitcode` is
+    only populated once the process has been reaped, so the two can be observed
+    out of order.
+    """
+
+    name = "EngineCore"
+
+    def __init__(self, sentinel, exitcode, reads_until_reaped):
+        self.sentinel = sentinel
+        self._exitcode = exitcode
+        self._remaining = reads_until_reaped
+        self.checks = 0
+
+    @property
+    def exitcode(self):
+        self.checks += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            return None
+        return self._exitcode
+
+
+def _startup_launch(processes):
+    manager = object.__new__(CoreEngineProcManager)
+    manager.processes = processes
+    return CoreEngineLaunch(
+        engine_manager=manager,
+        coordinator=None,
+        addresses=EngineZmqAddresses(inputs=[], outputs=[]),
+        tensor_queue=None,
+    )
+
+
+def _run_startup(launch):
+    ctx = zmq.Context()
+    handshake_socket = ctx.socket(zmq.ROUTER)
+    parallel_config = SimpleNamespace(
+        data_parallel_size_local=1,
+        data_parallel_hybrid_lb=False,
+        data_parallel_external_lb=False,
+    )
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            wait_for_engine_startup(
+                handshake_socket,
+                [CoreEngine()],
+                parallel_config,
+                coordinated_dp=False,
+                cache_config=None,
+                launch=launch,
+            )
+    finally:
+        handshake_socket.close(linger=0)
+        ctx.term()
+    return str(exc_info.value)
+
+
+def test_wait_for_engine_startup_waits_for_exit_code():
+    """A not-yet-reaped exit status is reported instead of an empty dict."""
+    recv, send = connection.Pipe(duplex=False)
+    send.close()
+    proc = _UnreapedProcess(recv.fileno(), exitcode=-9, reads_until_reaped=3)
+    try:
+        message = _run_startup(_startup_launch([proc]))
+    finally:
+        recv.close()
+
+    assert "Failed core proc(s): {'EngineCore': -9}" in message
+    assert proc.checks > 1
+
+
+def test_wait_for_engine_startup_ignores_spurious_exit_event(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A readable sentinel for a live process must not abort startup."""
+    monkeypatch.setenv("VLLM_ENGINE_READY_TIMEOUT_S", "2")
+    recv, send = connection.Pipe(duplex=False)
+    send.close()
+    # Never reaped: the process is still running.
+    proc = _UnreapedProcess(recv.fileno(), exitcode=-9, reads_until_reaped=1 << 30)
+    try:
+        message = _run_startup(_startup_launch([proc]))
+    finally:
+        recv.close()
+
+    assert "Failed core proc(s): {}" not in message
+    assert "no watched process ever reported an exit status" in message
+    # Tolerated at least one event before giving up.
+    assert "fired 1 times" not in message
+
+
 def _engine_config_hash(**overrides) -> str:
     """Hash of an engine's ParallelConfig after engine initialization."""
     config = ParallelConfig(data_parallel_size=2, data_parallel_size_local=2)

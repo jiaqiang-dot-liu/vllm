@@ -4,6 +4,7 @@
 import contextlib
 import os
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -41,6 +42,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 STARTUP_POLL_PERIOD_MS = 10000
+# How long to keep re-checking for the exit status of a process whose sentinel
+# signalled during startup, and how often to re-check. A sentinel becomes
+# readable when the process dies, but `Process.exitcode` is only populated once
+# the process has been reaped, so the two can be observed out of order.
+STARTUP_EXIT_REAP_TIMEOUT_S = 1.0
+STARTUP_EXIT_REAP_PERIOD_S = 0.01
 ROCM_ENGINE_PROCESS_SHUTDOWN_TIMEOUT_S = 15.0
 
 
@@ -1440,6 +1447,11 @@ def wait_for_engine_startup(
         frontend_process_by_fd[fd] = proc
         poller.register(fd, zmq.POLLIN)
 
+    # Budget for tolerating process-exit events that fire while every watched
+    # process is still alive (see the handler below).
+    spurious_exit_events = 0
+    spurious_exit_deadline = time.monotonic() + envs.VLLM_ENGINE_READY_TIMEOUT_S
+
     while any(conn_pending) or any(start_pending):
         events = poller.poll(STARTUP_POLL_PERIOD_MS)
         if not events:
@@ -1455,35 +1467,76 @@ def wait_for_engine_startup(
                 )
             continue
         if len(events) > 1 or events[0][0] != handshake_socket:
-            # One of the local core, coordinator, or watched frontend processes exited.
-            if isinstance(launch.engine_manager, CoreEngineProcManager):
-                finished = launch.engine_manager.finished_procs()
-            else:
-                finished = {}
-            if coord_process is not None and coord_process.exitcode is not None:
-                finished[coord_process.name] = coord_process.exitcode
-            failed_frontend_procs = {
-                proc.name: proc.exitcode
-                for fd, proc in frontend_process_by_fd.items()
-                if proc.exitcode is not None
-                or any(event_fd == fd for event_fd, _ in events)
-            }
+            # One of the local core, coordinator, or watched frontend processes
+            # exited. A sentinel becomes readable as soon as the process dies,
+            # but its exit status only becomes available once the process has
+            # been reaped, so re-check for a short while instead of reporting an
+            # empty set of failed processes with no exit code in it.
+            event_fds = {event_fd for event_fd, _ in events}
+            reap_deadline = time.monotonic() + STARTUP_EXIT_REAP_TIMEOUT_S
+            while True:
+                if isinstance(launch.engine_manager, CoreEngineProcManager):
+                    finished = launch.engine_manager.finished_procs()
+                else:
+                    finished = {}
+                if coord_process is not None and coord_process.exitcode is not None:
+                    finished[coord_process.name] = coord_process.exitcode
+                failed_frontend_procs = {
+                    proc.name: proc.exitcode
+                    for fd, proc in frontend_process_by_fd.items()
+                    if proc.exitcode is not None or fd in event_fds
+                }
+                exit_codes = (*finished.values(), *failed_frontend_procs.values())
+                if exit_codes and all(code is not None for code in exit_codes):
+                    break
+                if time.monotonic() >= reap_deadline:
+                    break
+                time.sleep(STARTUP_EXIT_REAP_PERIOD_S)
             if failed_frontend_procs and not finished:
                 raise RuntimeError(
                     "Frontend process failed during engine core initialization. "
                     "See root cause above. "
                     f"Failed frontend proc(s): {failed_frontend_procs}"
                 )
-            raise RuntimeError(
-                "Engine core initialization failed. "
-                "See root cause above. "
-                f"Failed core proc(s): {finished}"
-                + (
-                    f", failed frontend proc(s): {failed_frontend_procs}"
-                    if failed_frontend_procs
-                    else ""
+            if finished:
+                raise RuntimeError(
+                    "Engine core initialization failed. "
+                    "See root cause above. "
+                    f"Failed core proc(s): {finished}"
+                    + (
+                        f", failed frontend proc(s): {failed_frontend_procs}"
+                        if failed_frontend_procs
+                        else ""
+                    )
                 )
+            # No watched process reported an exit status, so none of them has
+            # actually exited: the event did not come from a dying process.
+            # Tearing the engines down here would kill a healthy startup and
+            # the resulting error ("Failed core proc(s): {}") would name no
+            # process and point at no root cause, so keep waiting for the
+            # engines to become ready instead. The wait is bounded by
+            # VLLM_ENGINE_READY_TIMEOUT_S, and the re-check above makes each
+            # pass back off, so a permanently-readable fd cannot spin.
+            spurious_exit_events += 1
+            if time.monotonic() >= spurious_exit_deadline:
+                raise RuntimeError(
+                    "Engine core initialization failed: process-exit events "
+                    f"fired {spurious_exit_events} times during startup, but no "
+                    "watched process ever reported an exit status within "
+                    f"VLLM_ENGINE_READY_TIMEOUT_S="
+                    f"{envs.VLLM_ENGINE_READY_TIMEOUT_S}s. Increase it if the "
+                    "engines simply need longer to start."
+                )
+            logger.warning(
+                "Process-exit event during engine startup (#%d), but no watched "
+                "process has reported an exit status. Ignoring it and continuing "
+                "to wait for the engine(s) to become ready.",
+                spurious_exit_events,
             )
+            if handshake_socket not in event_fds:
+                continue
+            # A handshake message is pending as well; fall through and consume
+            # it rather than dropping the engine's HELLO/READY message.
 
         # Receive HELLO and READY messages from the input socket.
         eng_identity, ready_msg_bytes = handshake_socket.recv_multipart()
